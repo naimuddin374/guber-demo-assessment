@@ -1,11 +1,11 @@
 import { Job } from "bullmq"
-import { countryCodes, dbServers, EngineType } from "../config/enums"
-import { ContextType } from "../libs/logger"
-import { jsonOrStringForDb, jsonOrStringToJson, stringOrNullForDb, stringToHash } from "../utils"
 import _ from "lodash"
+import { countryCodes } from "../config/enums"
+import { ContextType } from "../libs/logger"
 import { sources } from "../sites/sources"
-import items from "./../../pharmacyItems.json"
+import { stringToHash } from "../utils"
 import connections from "./../../brandConnections.json"
+import items from "./../../pharmacyItems.json"
 
 type BrandsMapping = {
     [key: string]: string[]
@@ -66,6 +66,31 @@ export function checkBrandIsSeparateTerm(input: string, brand: string): boolean 
     return atBeginningOrEnd || separateTerm
 }
 
+
+// a list of ignoring names
+const ignoringNames: string[] = [
+    "BIO",
+    "NEB",
+]
+
+// a list of special front brands
+const specialFrontBrands: string[] = ["rich", "rff", "flex", "ultra", "gum", "beauty", "orto", "free", "112", "kin", "happy"]
+
+// a list of front or 2nd word
+const specialStartOrSecond: string[] = ["heel", "contour", "nero", "rsv"];
+
+// normalize brand name to remove accents and other special characters
+function normalizeBrandName(brandName: string): string {
+    return brandName.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+}
+
+function isValidBrandMatch(brand: string, productTitle: string): boolean {
+    if (brand === "HAPPY" && !productTitle.includes("HAPPY")) return false
+    if (ignoringNames.includes(normalizeBrandName(productTitle))) return false
+    return true
+}
+
+
 export async function assignBrandIfKnown(countryCode: countryCodes, source: sources, job?: Job) {
     const context = { scope: "assignBrandIfKnown" } as ContextType
 
@@ -82,14 +107,48 @@ export async function assignBrandIfKnown(countryCode: countryCodes, source: sour
             continue
         }
 
+        // if the brand name is in the ignoring names, skip it
+        if (ignoringNames.includes(normalizeBrandName(product.title))) {
+            continue
+        }
+
         let matchedBrands = []
         for (const brandKey in brandsMapping) {
             const relatedBrands = brandsMapping[brandKey]
             for (const brand of relatedBrands) {
+
+                //  Skip for HAPPY as 
+                if (brand === "HAPPY" && !product.title.includes("HAPPY")) continue
+
+
+                if (product.title.toLowerCase().startsWith(brand.toLowerCase())) {
+                    matchedBrands.push(brand)
+                    continue
+                }
+
                 if (matchedBrands.includes(brand)) {
                     continue
                 }
-                const isBrandMatch = checkBrandIsSeparateTerm(product.title, brand)
+
+                const normalizedProductTitle = normalizeBrandName(product.title)
+                const normalizedBrand = normalizeBrandName(brand)
+                if (!isValidBrandMatch(normalizedBrand, normalizedProductTitle)) continue
+
+
+                // if the brand is a special front brand, check if the product title starts with the brand
+                if (specialFrontBrands.includes(normalizedBrand)) {
+                    if (!normalizedProductTitle.startsWith(normalizedBrand)) continue
+                }
+
+                // if the a list of front or 2nd word
+                const words = normalizedProductTitle.split(" ");
+                if (specialStartOrSecond.includes(normalizedBrand)) {
+                    if (!(words[0] === normalizedBrand || words[1] === normalizedBrand)) {
+                        continue;
+                    }
+                }
+
+                const isBrandMatch = checkBrandIsSeparateTerm(normalizedProductTitle, normalizedBrand)
                 if (isBrandMatch) {
                     matchedBrands.push(brand)
                 }
@@ -98,7 +157,8 @@ export async function assignBrandIfKnown(countryCode: countryCodes, source: sour
         console.log(`${product.title} -> ${_.uniq(matchedBrands)}`)
         const sourceId = product.source_id
         const meta = { matchedBrands }
-        const brand = matchedBrands.length ? matchedBrands[0] : null
+        const unifiedBrandGroup = _.uniq(matchedBrands).sort()
+        const brand = unifiedBrandGroup.length ? unifiedBrandGroup[0] : null
 
         const key = `${source}_${countryCode}_${sourceId}`
         const uuid = stringToHash(key)
